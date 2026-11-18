@@ -51,6 +51,9 @@
       staleNotified: false,
       pending: {},
       verifyFailedKey: {},
+      // Последняя заметка каждой цели: пока заметка не меняется («жду врача»,
+      // «все слоты отброшены»), в лог она попадает один раз, а не каждый тик.
+      lastNotes: {},
       leadershipHandlers: [],
     };
 
@@ -63,6 +66,7 @@
       state.list = list.map((t) => ({ ...t }));
       state.byId = {};
       state.verifyFailedKey = {};
+      state.lastNotes = {};
       for (const t of state.list) state.byId[t.id] = { state: 'idle', note: '' };
       // Смена целей обнуляет подтверждение холостого прогона — иначе можно
       // было бы подтвердить одни цели, а незаметно подставить другие.
@@ -189,6 +193,10 @@
           waiting: !best,
           warnings: buildWarnings(t, best, r, appts),
           notes: r.notes,
+          // Мимо фильтра адреса/врача — обвязка рисует их кликабельными
+          // (нажал — фильтр цели обновлён, холостой прогон повторён сам).
+          skippedAddresses: (r.skippedAddresses || []).slice(0, 12),
+          skippedDoctors: (r.skippedDoctors || []).slice(0, 12),
         });
       }
       const report = { id: hash({ list: state.list, at: now() }), items, targetsHash: gateFingerprint(state.list) };
@@ -402,9 +410,22 @@
             }
 
             if (!r.candidates.length) {
-              if (r.notes && r.notes.length) log(`${t.title}: ${r.notes.join('; ')}`);
+              if (r.notes && r.notes.length) {
+                // Одна и та же ситуация («жду врача», «все слоты отброшены»)
+                // занимает лог один раз; как только ситуация изменилась —
+                // пишем снова.
+                const key = r.notes.join('; ');
+                if (state.lastNotes[t.id] !== key) {
+                  state.lastNotes[t.id] = key;
+                  log(`${t.title}: ${key}`);
+                }
+              } else if (state.lastNotes[t.id]) {
+                delete state.lastNotes[t.id];
+              }
               continue;
             }
+            // Кандидаты нашлись — прежняя заметка устарела.
+            delete state.lastNotes[t.id];
 
             const cand = r.candidates[0];
             const key = candidateKey(cand);

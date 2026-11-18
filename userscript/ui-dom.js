@@ -829,7 +829,49 @@
       const warn = line.trim().startsWith('⚠');
       box.appendChild(h('p', { class: warn ? 'esh-warn' : 'esh-note', text: line.trim() }));
     }
+    // Адреса и врачи, отфильтрованные условиями, рисуем кнопками: нажал —
+    // фильтр этой цели обновлён, холостой прогон пересчитан сам.
+    if (item.skippedAddresses && item.skippedAddresses.length) {
+      box.appendChild(h('p', { class: 'esh-note', text: 'Отсеяны по адресу — нажмите на адрес, чтобы разрешить его:' }));
+      box.appendChild(h('div', { class: 'esh-chips' },
+        item.skippedAddresses.map((addr) => h('button', {
+          class: 'esh-chip', text: '+ ' + addr,
+          onclick: () => allowSkippedAddress(item.targetId, addr),
+        }))));
+    }
+    if (item.skippedDoctors && item.skippedDoctors.length) {
+      box.appendChild(h('p', { class: 'esh-note', text: 'Врачи мимо фильтра — нажмите на фамилию, чтобы искать у него:' }));
+      box.appendChild(h('div', { class: 'esh-chips' },
+        item.skippedDoctors.map((name) => h('button', {
+          class: 'esh-chip', text: name,
+          onclick: () => allowSkippedDoctor(item.targetId, name),
+        }))));
+    }
     return box;
+  }
+
+  // Клик по отсеянному адресу: добавляем его в «адрес содержит» фразой в
+  // кавычках (адрес содержит пробелы — без кавычек он распался бы на слова)
+  // и пересчитываем холостой прогон. Раньше заданные условия «тот же корпус»
+  // превращаются в явный фильтр, к которому адрес и дописывается.
+  function allowSkippedAddress(optionId, address) {
+    const form = wizard.forms[optionId];
+    if (!form) return;
+    const cur = String(form.addressContains || '').trim();
+    if (cur.toLowerCase().includes(address.toLowerCase())) return; // уже разрешён
+    const quoted = '+' + JSON.stringify(address);
+    form.where = 'contains';
+    form.addressContains = cur ? cur + ' ' + quoted : quoted;
+    loadStep3();
+  }
+
+  // Клик по врачу из списка мимо фильтра: фиксируем его точной фразой
+  // («+»ФИО целиком»») и пересчитываем холостой прогон.
+  function allowSkippedDoctor(optionId, name) {
+    const form = wizard.forms[optionId];
+    if (!form) return;
+    form.doctorContains = '+(' + JSON.stringify(name) + ')';
+    loadStep3();
   }
 
   function renderStep3(report) {
@@ -870,6 +912,9 @@
     }
     try {
       core.confirmDryRun(wizard.report.id);
+      // Лог прошлой охоты очищаем: записи со СТАРЫМ фильтром рядом с записями
+      // новой читались как «фильтр всё ещё тот».
+      logEvents.length = 0;
       await core.start();
       // C-1 п.2: новое подтверждение снимает паузу (новый объект настроек
       // без paused/pausedAt).

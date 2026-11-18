@@ -618,3 +618,39 @@ test('запись на анализ по назначению узнаётся 
   assert.equal(h.seen[0].scenario, 'shiftLab');
   assert.equal(h.seen[0].appointmentId, 77);
 });
+
+test('dryRun отдаёт в отчёте адреса и врачей мимо фильтра для кликабельных подсказок', async () => {
+  const h = harness({
+    search: async () => ({
+      candidates: [], rejected: [], notes: [],
+      skippedAddresses: ['улица Алтайская, д. 13'], skippedDoctors: ['Хирург_Кудров_Ю.Ю.'],
+    }),
+  });
+  h.runner.setTargets([{ ...target }]);
+  const report = await h.runner.dryRun();
+  assert.deepEqual(report.items[0].skippedAddresses, ['улица Алтайская, д. 13']);
+  assert.deepEqual(report.items[0].skippedDoctors, ['Хирург_Кудров_Ю.Ю.']);
+});
+
+test('повторяющаяся заметка цели попадает в лог один раз, новая — сразу', async () => {
+  const notes = { list: ['жду врача'] };
+  const h = harness({
+    search: async () => ({ candidates: [], rejected: [], notes: [...notes.list] }),
+  });
+  h.runner.setTargets([{ ...target }]);
+  h.runner.confirmDryRun((await h.runner.dryRun()).id);
+  await h.runner.start();
+  await h.runner.tick();
+  h.advance(20000);
+  await h.runner.tick();
+  h.advance(20000);
+  await h.runner.tick();
+  const sameNotesLogs = h.events.filter((e) => e.type === 'log');
+  assert.equal(sameNotesLogs.length, 1, 'одинаковая заметка — одна запись');
+
+  notes.list = ['врач появился в другом корпусе'];
+  h.advance(20000);
+  await h.runner.tick();
+  const allLogs = h.events.filter((e) => e.type === 'log');
+  assert.equal(allLogs.length, 2, 'изменившаяся заметка логируется снова');
+});

@@ -691,6 +691,7 @@
       const candidates = [];
       let rejected = [];
       let addressMismatch = 0;
+      const skippedAddresses = new Set();
       let addressUnknown = 0;
       // C2: без этой проверки цикл продолжал бы слать getAvailableResourceScheduleInfo
       // по всем оставшимся кабинетам/врачам даже после того, как ЕМИАС уже ответил 429 —
@@ -720,7 +721,11 @@
           if (!address) { addressUnknown++; continue; }
           // Фильтр адреса с несколькими ключами («+знамя труда -шишкин», см.
           // filters.addressMatches) — на месте прежнего одиночного includes().
-          if (t.addressContains && !filters.addressMatches(address, t.addressContains)) { addressMismatch++; continue; }
+          if (t.addressContains && !filters.addressMatches(address, t.addressContains)) {
+            addressMismatch++;
+            skippedAddresses.add(address);
+            continue;
+          }
           const slots = scheduleSlots(s.json.payload, cr.id);
           const picked = filters.pickSlots({
             slots,
@@ -735,11 +740,17 @@
         }
       }
       if (addressUnknown) notes.push(`Не удалось определить адрес ${addressUnknown} кабинет(ов) в расписании — пропущены`);
-      if (addressMismatch) notes.push(`Кабинетов с другим адресом пропущено: ${addressMismatch}`);
+      // Перечисляем пропущенные адреса: иначе человек видит «пропущено: 2» и не
+      // понимает, то ли фильтр отсеял лишнее, то ли отсеяно то, что ему было нужно.
+      if (addressMismatch) {
+        notes.push(`Кабинетов с другим адресом пропущено: ${addressMismatch}`
+          + (skippedAddresses.size ? ` — ${[...skippedAddresses].join('; ')}` : ''));
+      }
       if (pausedByBackoff) notes.push('ЕМИАС попросил паузу — часть кабинетов не проверена, продолжу на следующей проверке');
       // Структурированный список мимо фильтров — обвязка рисует его кликабельным.
       return {
         candidates, rejected, notes, action,
+        skippedAddresses: [...skippedAddresses],
         skippedDoctors: [...skippedDoctors],
       };
     }
@@ -981,6 +992,9 @@
       staleNotified: false,
       pending: {},
       verifyFailedKey: {},
+      // Последняя заметка каждой цели: пока заметка не меняется («жду врача»,
+      // «все слоты отброшены»), в лог она попадает один раз, а не каждый тик.
+      lastNotes: {},
       leadershipHandlers: [],
     };
 
@@ -993,6 +1007,7 @@
       state.list = list.map((t) => ({ ...t }));
       state.byId = {};
       state.verifyFailedKey = {};
+      state.lastNotes = {};
       for (const t of state.list) state.byId[t.id] = { state: 'idle', note: '' };
       // Смена целей обнуляет подтверждение холостого прогона — иначе можно
       // было бы подтвердить одни цели, а незаметно подставить другие.
@@ -1119,6 +1134,10 @@
           waiting: !best,
           warnings: buildWarnings(t, best, r, appts),
           notes: r.notes,
+          // Мимо фильтра адреса/врача — обвязка рисует их кликабельными
+          // (нажал — фильтр цели обновлён, холостой прогон повторён сам).
+          skippedAddresses: (r.skippedAddresses || []).slice(0, 12),
+          skippedDoctors: (r.skippedDoctors || []).slice(0, 12),
         });
       }
       const report = { id: hash({ list: state.list, at: now() }), items, targetsHash: gateFingerprint(state.list) };
@@ -1332,9 +1351,22 @@
             }
 
             if (!r.candidates.length) {
-              if (r.notes && r.notes.length) log(`${t.title}: ${r.notes.join('; ')}`);
+              if (r.notes && r.notes.length) {
+                // Одна и та же ситуация («жду врача», «все слоты отброшены»)
+                // занимает лог один раз; как только ситуация изменилась —
+                // пишем снова.
+                const key = r.notes.join('; ');
+                if (state.lastNotes[t.id] !== key) {
+                  state.lastNotes[t.id] = key;
+                  log(`${t.title}: ${key}`);
+                }
+              } else if (state.lastNotes[t.id]) {
+                delete state.lastNotes[t.id];
+              }
               continue;
             }
+            // Кандидаты нашлись — прежняя заметка устарела.
+            delete state.lastNotes[t.id];
 
             const cand = r.candidates[0];
             const key = candidateKey(cand);
@@ -2725,7 +2757,49 @@
       const warn = line.trim().startsWith('⚠');
       box.appendChild(h('p', { class: warn ? 'esh-warn' : 'esh-note', text: line.trim() }));
     }
+    // Адреса и врачи, отфильтрованные условиями, рисуем кнопками: нажал —
+    // фильтр этой цели обновлён, холостой прогон пересчитан сам.
+    if (item.skippedAddresses && item.skippedAddresses.length) {
+      box.appendChild(h('p', { class: 'esh-note', text: 'Отсеяны по адресу — нажмите на адрес, чтобы разрешить его:' }));
+      box.appendChild(h('div', { class: 'esh-chips' },
+        item.skippedAddresses.map((addr) => h('button', {
+          class: 'esh-chip', text: '+ ' + addr,
+          onclick: () => allowSkippedAddress(item.targetId, addr),
+        }))));
+    }
+    if (item.skippedDoctors && item.skippedDoctors.length) {
+      box.appendChild(h('p', { class: 'esh-note', text: 'Врачи мимо фильтра — нажмите на фамилию, чтобы искать у него:' }));
+      box.appendChild(h('div', { class: 'esh-chips' },
+        item.skippedDoctors.map((name) => h('button', {
+          class: 'esh-chip', text: name,
+          onclick: () => allowSkippedDoctor(item.targetId, name),
+        }))));
+    }
     return box;
+  }
+
+  // Клик по отсеянному адресу: добавляем его в «адрес содержит» фразой в
+  // кавычках (адрес содержит пробелы — без кавычек он распался бы на слова)
+  // и пересчитываем холостой прогон. Раньше заданные условия «тот же корпус»
+  // превращаются в явный фильтр, к которому адрес и дописывается.
+  function allowSkippedAddress(optionId, address) {
+    const form = wizard.forms[optionId];
+    if (!form) return;
+    const cur = String(form.addressContains || '').trim();
+    if (cur.toLowerCase().includes(address.toLowerCase())) return; // уже разрешён
+    const quoted = '+' + JSON.stringify(address);
+    form.where = 'contains';
+    form.addressContains = cur ? cur + ' ' + quoted : quoted;
+    loadStep3();
+  }
+
+  // Клик по врачу из списка мимо фильтра: фиксируем его точной фразой
+  // («+»ФИО целиком»») и пересчитываем холостой прогон.
+  function allowSkippedDoctor(optionId, name) {
+    const form = wizard.forms[optionId];
+    if (!form) return;
+    form.doctorContains = '+(' + JSON.stringify(name) + ')';
+    loadStep3();
   }
 
   function renderStep3(report) {
@@ -2766,6 +2840,9 @@
     }
     try {
       core.confirmDryRun(wizard.report.id);
+      // Лог прошлой охоты очищаем: записи со СТАРЫМ фильтром рядом с записями
+      // новой читались как «фильтр всё ещё тот».
+      logEvents.length = 0;
       await core.start();
       // C-1 п.2: новое подтверждение снимает паузу (новый объект настроек
       // без paused/pausedAt).

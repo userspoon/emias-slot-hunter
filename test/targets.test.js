@@ -53,6 +53,8 @@ test('фильтр по адресу отбрасывает чужие каби�
   const r = await t.search({ ...labTarget, addressContains: 'к. 28' }, { now: NOW, appointments: [] });
   assert.equal(r.candidates.length, 0);
   assert.match(r.notes.join(' '), /адрес/i);
+  // Пропущенные адреса перечисляются явно — иначе непонятно, что именно отфильтровано.
+  assert.match(r.notes.join(' '), /улица Тестовая, д. 2/);
 });
 
 test('shiftLab передаёт appointmentId и moId записи', async () => {
