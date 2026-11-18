@@ -154,6 +154,7 @@
       const candidates = [];
       let rejected = [];
       let addressMismatch = 0;
+      const skippedAddresses = new Set();
       let addressUnknown = 0;
       // C2: без этой проверки цикл продолжал бы слать getAvailableResourceScheduleInfo
       // по всем оставшимся кабинетам/врачам даже после того, как ЕМИАС уже ответил 429 —
@@ -183,7 +184,11 @@
           if (!address) { addressUnknown++; continue; }
           // Фильтр адреса с несколькими ключами («+знамя труда -шишкин», см.
           // filters.addressMatches) — на месте прежнего одиночного includes().
-          if (t.addressContains && !filters.addressMatches(address, t.addressContains)) { addressMismatch++; continue; }
+          if (t.addressContains && !filters.addressMatches(address, t.addressContains)) {
+            addressMismatch++;
+            skippedAddresses.add(address);
+            continue;
+          }
           const slots = scheduleSlots(s.json.payload, cr.id);
           const picked = filters.pickSlots({
             slots,
@@ -198,11 +203,17 @@
         }
       }
       if (addressUnknown) notes.push(`Не удалось определить адрес ${addressUnknown} кабинет(ов) в расписании — пропущены`);
-      if (addressMismatch) notes.push(`Кабинетов с другим адресом пропущено: ${addressMismatch}`);
+      // Перечисляем пропущенные адреса: иначе человек видит «пропущено: 2» и не
+      // понимает, то ли фильтр отсеял лишнее, то ли отсеяно то, что ему было нужно.
+      if (addressMismatch) {
+        notes.push(`Кабинетов с другим адресом пропущено: ${addressMismatch}`
+          + (skippedAddresses.size ? ` — ${[...skippedAddresses].join('; ')}` : ''));
+      }
       if (pausedByBackoff) notes.push('ЕМИАС попросил паузу — часть кабинетов не проверена, продолжу на следующей проверке');
       // Структурированный список мимо фильтров — обвязка рисует его кликабельным.
       return {
         candidates, rejected, notes, action,
+        skippedAddresses: [...skippedAddresses],
         skippedDoctors: [...skippedDoctors],
       };
     }
