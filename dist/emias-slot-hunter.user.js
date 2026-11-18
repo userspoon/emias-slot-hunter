@@ -663,7 +663,30 @@
       if (t.scenario === 'bookDoctor' && t.source.availableResourceId) {
         resources = resources.filter((r) => String(r.id) === String(t.source.availableResourceId));
       }
-      if (!resources.length) return { candidates: [], rejected: [], notes: ['Свободных кабинетов или врачей сейчас нет'], action: null };
+      // Фильтр врача по имени: у врача r.name — ФИО («Иванова Анна Петровна»),
+      // у кабинета — номер/название. Синтаксис тот же, что у фильтра адреса
+      // («+иванов -петров», кавычки для фраз), см. filters.addressMatches.
+      // Если подошедших нет — это не ошибка, а режим ожидания: нужный врач
+      // (например, «недоступный для самостоятельной записи» на сайте)
+      // появится в списке, когда у него откроется запись.
+      const skippedDoctors = new Set();
+      if (t.doctorContains) {
+        const matched = [];
+        for (const r of resources) {
+          if (filters.addressMatches(r.name || '', t.doctorContains)) matched.push(r);
+          else skippedDoctors.add(r.name || '(без имени)');
+        }
+        resources = matched;
+      }
+      if (!resources.length) {
+        const note = t.doctorContains && skippedDoctors.size
+          ? `Жду врача по фильтру «${t.doctorContains}». Пока в списке ЕМИАС только: ${[...skippedDoctors].join('; ')}`
+          : 'Свободных кабинетов или врачей сейчас нет';
+        return {
+          candidates: [], rejected: [], notes: [note], action: null,
+          skippedAddresses: [], skippedDoctors: [...skippedDoctors],
+        };
+      }
 
       const candidates = [];
       let rejected = [];
@@ -714,7 +737,45 @@
       if (addressUnknown) notes.push(`Не удалось определить адрес ${addressUnknown} кабинет(ов) в расписании — пропущены`);
       if (addressMismatch) notes.push(`Кабинетов с другим адресом пропущено: ${addressMismatch}`);
       if (pausedByBackoff) notes.push('ЕМИАС попросил паузу — часть кабинетов не проверена, продолжу на следующей проверке');
-      return { candidates, rejected, notes, action };
+      // Структурированный список мимо фильтров — обвязка рисует его кликабельным.
+      return {
+        candidates, rejected, notes, action,
+        skippedDoctors: [...skippedDoctors],
+      };
+    }
+
+    // Имена врачей для подсказки в мастере: и доступные для записи сейчас,
+    // и недоступные («врачи, недоступные для самостоятельной записи» на
+    // сайте — там прячется нужный, пока у него закрыта запись). Недоступный
+    // врач в поиске слотов не участвует, но выбрать его можно: охота будет
+    // ждать его появления среди доступных и запишет сама. Возвращаем
+    // { available, unavailable } — имена без дублей и пересечений.
+    async function listDoctors(t, now = Date.now()) {
+      const p = period(t, now);
+      const res = await listResources(t, p);
+      if (!res.ok) {
+        throw new Error(res.explained ? res.explained.message : 'ЕМИАС не отдал список врачей');
+      }
+      const seen = new Set();
+      const available = [];
+      const unavailable = [];
+      (function walk(node, notAvail) {
+        if (Array.isArray(node)) { node.forEach((n) => walk(n, notAvail)); return; }
+        if (!node || typeof node !== 'object') return;
+        const selfNotAvail = node.notAvailable === true || node.available === false;
+        for (const [k, v] of Object.entries(node)) {
+          if (v && typeof v === 'object') walk(v, notAvail || selfNotAvail || /notAvailable/i.test(k));
+        }
+        if (!node.id || !node.name || !Array.isArray(node.complexResource) || !('arType' in node) || seen.has(node.id)) return;
+        seen.add(node.id);
+        const name = String(node.name).trim();
+        if (!name) return;
+        if (notAvail || selfNotAvail) { if (!unavailable.includes(name)) unavailable.push(name); }
+        else if (!available.includes(name)) available.push(name);
+      })(res.json && res.json.payload, false);
+      // Имя может оказаться в обоих списках (в одном корпусе доступен, в
+      // другом нет) — оставляем только в «доступных».
+      return { available, unavailable: unavailable.filter((n) => !available.includes(n)) };
     }
 
     // Проверяем, что найденная в списке запись — действительно та, что мы только что
@@ -731,13 +792,19 @@
     function matches(t, appt, cand, beforeIds) {
       if (toMs(appt.startTime) !== toMs(cand.slot.startTime)) return false;
       if (campus(appt.lpuAddress) !== campus(cand.address)) return false;
+      // Фильтр врача задан, и ЕМИАС отдал ФИО врача в записи — сверяем по нему:
+      // иначе приём к другому врачу в то же время в том же кампусе сойдёт за наш.
+      // Если ФИО в записи нет (поле не пришло), сверить не с чем — не мешаем.
+      const doctorFioOk = (t.doctorContains && appt.toDoctor && appt.toDoctor.doctorFio)
+        ? filters.addressMatches(appt.toDoctor.doctorFio, t.doctorContains)
+        : true;
       if (t.scenario === 'bookLab') {
         if (beforeIds.has(appt.id)) return false;
         return !!appt.toBM && Number(appt.toBM.id) === Number(t.source.samplingTypeId);
       }
       if (t.scenario === 'bookDoctor') {
         if (beforeIds.has(appt.id)) return false;
-        return !!appt.toDoctor;
+        return !!appt.toDoctor && doctorFioOk;
       }
       if (t.scenario === 'bookLdp') {
         if (beforeIds.has(appt.id)) return false;
@@ -750,7 +817,7 @@
       if (appt.id !== t.source.appointmentId && beforeIds.has(appt.id)) return false;
       if (t.scenario === 'shiftLdp') return !!appt.toLdp && Number(appt.toLdp.ldpTypeId) === Number(t.source.ldpTypeId);
       if (t.scenario === 'shiftDoctor') {
-        return !!appt.toDoctor && (!t.source.specialityName || appt.toDoctor.specialityName === t.source.specialityName);
+        return !!appt.toDoctor && doctorFioOk && (!t.source.specialityName || appt.toDoctor.specialityName === t.source.specialityName);
       }
       if (t.scenario === 'shiftLab') return !!appt.toBM && Number(appt.toBM.id) === Number(t.source.samplingTypeId);
       return false;
@@ -852,7 +919,7 @@
       return { ok: true, verified: true, message: 'Готово', newAppointment: verify.found, action: null };
     }
 
-    return { search, act };
+    return { search, act, listDoctors };
   }
 
   const api = { createTargets };
@@ -1715,6 +1782,7 @@
         timeTo: form.timeTo || null,
         addressContains: form.where === 'sameCampus' ? stripCampus(option.address)
           : form.where === 'contains' ? (form.addressContains || null) : null,
+        doctorContains: form.doctorContains || null,
         prefer: form.preferUntil ? { until: form.preferUntil, timeTo: form.preferTimeTo || null } : null,
         near: form.nearStart && form.nearEnd ? { start: form.nearStart, end: form.nearEnd } : null,
         respectTravel: form.respectTravel !== false,
@@ -1756,6 +1824,7 @@
 
       if (t.timeFrom || t.timeTo) parts.push(`время с ${t.timeFrom || '00:00'} до ${t.timeTo || '23:59'}`);
       if (t.addressContains) parts.push(`адрес: ${t.addressContains}`);
+      if (t.doctorContains) parts.push(`врач: ${t.doctorContains}`);
       if (t.prefer) {
         let preferText = `сначала предпочитаю до ${dayHuman(t.prefer.until)}`;
         if (t.prefer.timeTo) preferText += `, до ${t.prefer.timeTo}`;
@@ -2051,6 +2120,11 @@
       .esh-btn.danger { background: #d64545; color: #fff; border-color: #d64545; }
       .esh-warn { color: #a33; font-size: 12px; }
       .esh-note { color: #666; font-size: 12px; }
+      .esh-chips { margin: 4px 0 2px; }
+      .esh-chip { display: inline-block; margin: 2px 6px 2px 0; padding: 3px 10px; font-size: 12px; text-align: left; color: #1b4d8f; background: #eaf2fb; border: 1px solid #b9d0ea; border-radius: 12px; cursor: pointer; }
+      .esh-chip:hover { background: #d8e8f8; border-color: #8fb6e0; }
+      .esh-chip-off { background: #f1f1f3; color: #555; border-color: #ccc; }
+      .esh-chip-off:hover { background: #e4e4e8; border-color: #aaa; }
       .esh-status-target { margin-bottom: 8px; }
       .esh-status-target p { margin: 2px 0; }
       .esh-confirm { width: 300px; max-width: calc(100vw - 32px); box-sizing: border-box; background: #fff8ea; border: 1px solid #e0b84b; border-radius: 10px; padding: 10px; margin-bottom: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.2); }
@@ -2386,6 +2460,7 @@
         when: 'earlier',
         day: '', dateFrom: '', dateTo: '', timeFrom: '', timeTo: '',
         where: option.address ? 'sameCampus' : 'any', addressContains: '',
+        doctorContains: '',
         respectTravel: true, mode: 'auto', purpose: 'unwell',
       };
     }
@@ -2447,6 +2522,73 @@
     return h('div', {}, [group, addrInput]);
   }
 
+  // Поле «Врач» показываем только для целей про приёмы к врачу: у них имя
+  // ресурса в ЕМИАС — это ФИО. По мере ввода фамилии подтягиваем список
+  // доступных врачей и предлагаем подходящих кнопками; клик фиксирует врача
+  // точной фразой. Недоступные для самостоятельной записи врачи тоже
+  // показываются (серые кнопки «· ждать») — охота будет ждать их появления.
+  // Свободный фильтр («+иванов -петров») продолжает работать как раньше.
+  function doctorField(option, form, quiet) {
+    if (!/Doctor/.test(option.scenario)) return null;
+    const matchesBox = h('div', { class: 'esh-chips' });
+    const chip = (name, off) => h('button', {
+      class: 'esh-chip' + (off ? ' esh-chip-off' : ''), text: off ? name + ' · ждать' : name,
+      onclick: () => { quiet({ doctorContains: '+("' + name + '")' }); renderMatches(); },
+    });
+    const renderMatches = () => {
+      clear(matchesBox);
+      const q = String(form.doctorContains || '').trim().toLowerCase();
+      if (!q) return;
+      const docs = form.doctors || { available: [], unavailable: [] };
+      const match = (list) => list.filter((n) => n.toLowerCase().includes(q));
+      const av = match(docs.available);
+      const un = match(docs.unavailable);
+      for (const name of av.slice(0, 8)) matchesBox.appendChild(chip(name));
+      if (un.length) {
+        matchesBox.appendChild(h('p', { class: 'esh-note', text: 'Сейчас недоступны для записи — выберите, и охота будет ждать его:' }));
+        for (const name of un.slice(0, 8)) matchesBox.appendChild(chip(name, true));
+      }
+      // Такой фамилии в списках нет (и точный выбор уже не сделан) —
+      // показываем всех, кого нашёл ЕМИАС: врачи зовутся не всегда ожидаемо
+      // («Хирург_Рзаева_Ю.М.»), надо дать увидеть всех.
+      const exactPicked = [...docs.available, ...docs.unavailable].some((n) => q.includes(n.toLowerCase()));
+      if (!av.length && !un.length && !exactPicked && form.doctorsLoaded && (docs.available.length + docs.unavailable.length)) {
+        matchesBox.appendChild(h('p', { class: 'esh-warn', text: `Врача по «${form.doctorContains}» в списке нет. Кто есть — нажмите, чтобы выбрать:` }));
+        for (const name of docs.available.slice(0, 8)) matchesBox.appendChild(chip(name));
+        if (docs.unavailable.length) {
+          matchesBox.appendChild(h('p', { class: 'esh-note', text: 'Недоступные сейчас (тоже можно выбрать — будем ждать):' }));
+          for (const name of docs.unavailable.slice(0, 8)) matchesBox.appendChild(chip(name, true));
+        }
+      }
+    };
+    const load = async () => {
+      if (form.doctorsLoaded || form.doctorsLoading) { renderMatches(); return; }
+      form.doctorsLoading = true;
+      try {
+        form.doctors = await core.listDoctors(option);
+      } catch (e) {
+        matchesBox.appendChild(h('p', { class: 'esh-warn', text: 'Список врачей не получен: ' + (e && e.message) }));
+      } finally {
+        form.doctorsLoading = false;
+        form.doctorsLoaded = true;
+      }
+      renderMatches();
+    };
+    return h('div', {}, [
+      h('label', { class: 'esh-field', text: 'Врач' }),
+      h('input', {
+        type: 'text', value: form.doctorContains || '', placeholder: 'фамилия, например, Иванова',
+        onfocus: () => { load(); renderMatches(); },
+        oninput: (e) => { quiet({ doctorContains: e.target.value }); load(); renderMatches(); },
+      }),
+      matchesBox,
+      h('p', {
+        class: 'esh-note',
+        text: 'Начните вводить фамилию и выберите врача из списка. Если нужного врача в списке нет — он сейчас недоступен для записи: впишите фамилию текстом, и охота будет ждать его появления, записав сразу, как он откроется.',
+      }),
+    ]);
+  }
+
   function advancedFields(form, quiet) {
     const field = (label, type, key) => h('label', { class: 'esh-field' }, [
       label, h('input', { type, value: form[key], onchange: (e) => quiet({ [key]: e.target.value }) }),
@@ -2476,6 +2618,8 @@
     card.appendChild(whenField(option, form, update, quiet));
     card.appendChild(h('label', { class: 'esh-field', text: 'Где' }));
     card.appendChild(whereField(option, form, update, quiet));
+    const doctor = doctorField(option, form, quiet);
+    if (doctor) card.appendChild(doctor);
     const purpose = purposeField(option, form, update);
     if (purpose) card.appendChild(purpose);
     card.appendChild(h('label', { class: 'esh-row' }, [
@@ -2512,6 +2656,13 @@
       const { parseAddressFilter } = globalThis.EmiasCore || {};
       const f = parseAddressFilter ? parseAddressFilter(form.addressContains) : { any: ['x'], none: [] };
       if (!f.any.length && !f.none.length) return 'укажите хотя бы один ключ адреса';
+    }
+    // То же правило для фильтра врача: непустая строка без осмысленных ключей
+    // («---») дала бы пустой фильтр и молча пропустила бы всех врачей.
+    if (form.doctorContains && form.doctorContains.trim()) {
+      const { parseAddressFilter } = globalThis.EmiasCore || {};
+      const f = parseAddressFilter ? parseAddressFilter(form.doctorContains) : { any: ['x'], none: [] };
+      if (!f.any.length && !f.none.length) return 'укажите хотя бы один ключ врача';
     }
     return null;
   }

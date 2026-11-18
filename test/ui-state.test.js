@@ -191,3 +191,12 @@ test('describeTarget: bookDoctor упоминает выбранную цель 
   const s = ui.describeTarget(t);
   assert.match(s, /цель визита: Оформление документов/i);
 });
+
+test('buildTarget/describeTarget: фильтр врача попадает в цель и в описание', () => {
+  const t = ui.buildTarget(option, { when: 'earlier', where: 'any', doctorContains: '+иванов -петров', mode: 'auto' });
+  assert.equal(t.doctorContains, '+иванов -петров');
+  const s = ui.describeTarget({ ...t, title: 'УЗИ вен' });
+  assert.match(s, /врач: \+иванов -петров/);
+  const noDoctor = ui.buildTarget(option, { when: 'earlier', where: 'any', mode: 'auto' });
+  assert.equal(noDoctor.doctorContains, null);
+});
